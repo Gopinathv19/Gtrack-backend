@@ -3,7 +3,7 @@ from typing import Generator
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from sqlalchemy.orm import Session
 
@@ -13,9 +13,8 @@ from app.db.session import SessionLocal
 from app.models import User, UserRole, Role
 from app.models.enums import RoleName
 
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V1_PREFIX}/auth/login", auto_error=False
-)
+# Use HTTPBearer for cleaner Swagger UI (just access token field, no OAuth2 fields)
+security = HTTPBearer(auto_error=False)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -27,15 +26,17 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def get_current_user(
-    token: str | None = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
-    if not token:
+    if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    token = credentials.credentials
     try:
         payload = decode_token(token)
         user_id: str | None = payload.get("sub")

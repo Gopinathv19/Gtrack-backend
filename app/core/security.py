@@ -4,21 +4,36 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import settings
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 # ---------- Password helpers ----------
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    """Hash a password using bcrypt.
+    
+    Note: bcrypt has a 72 byte limit. We truncate to 72 bytes to avoid errors.
+    This is a standard practice and still provides strong security.
+    """
+    # Truncate to 72 bytes to comply with bcrypt limitations
+    password_bytes = password.encode('utf-8')[:72]
+    # Generate salt and hash
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    """Verify a password against a bcrypt hash.
+    
+    Note: Truncates to 72 bytes to match hash_password behavior.
+    """
+    # Truncate to 72 bytes to match hashing behavior
+    password_bytes = plain.encode('utf-8')[:72]
+    hashed_bytes = hashed.encode('utf-8')
+    return bcrypt.checkpw(password_bytes, hashed_bytes)
 
 
 # ---------- JWT helpers ----------
