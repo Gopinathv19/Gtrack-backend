@@ -44,7 +44,7 @@ def _now_utc() -> datetime:
 def create_access_token(
     *,
     user_id: UUID | str,
-    org_id: UUID | str,
+    org_id: UUID | str | None = None,
     email: str | None = None,
     roles: list[str] | None = None,
     expires_minutes: int | None = None,
@@ -54,7 +54,9 @@ def create_access_token(
     )
     payload: dict[str, Any] = {
         "sub": str(user_id),
-        "org_id": str(org_id),
+        # org_id may be None for newly-registered users who haven't
+        # created or joined an organization yet.
+        "org_id": str(org_id) if org_id is not None else None,
         "email": email,
         "roles": roles or [],
         "iss": settings.JWT_ISSUER,

@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000"]
 
+    # Refresh token cookie
+    REFRESH_COOKIE_NAME: str = "refresh_token"
+    REFRESH_COOKIE_PATH: str = "/api/v1/auth"
+    REFRESH_COOKIE_SECURE: bool = False  # set True in production (HTTPS)
+    REFRESH_COOKIE_SAMESITE: str = "lax"  # "lax" | "strict" | "none"
+    REFRESH_COOKIE_DOMAIN: str | None = None
+
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v):

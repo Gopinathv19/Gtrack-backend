@@ -59,6 +59,16 @@ def get_current_user(
 
 
 def get_current_org_id(user: User = Depends(get_current_user)) -> UUID:
+    """Return the current user's organization id.
+
+    Users can register without an organization, but every tenant-scoped
+    endpoint needs one. We surface a clear 400 instead of crashing.
+    """
+    if user.organization_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You must create or join an organization before using this endpoint.",
+        )
     return user.organization_id
 
 

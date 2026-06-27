@@ -1,6 +1,6 @@
 """Schemas package."""
 from app.schemas.common import Page, Message, ORMBase  # noqa
-from app.schemas.auth import LoginRequest, TokenPair, RefreshRequest, TokenPayload  # noqa
+from app.schemas.auth import LoginRequest, TokenPair, TokenPayload  # noqa
 from app.schemas.organization import (  # noqa
     OrganizationCreate, OrganizationUpdate, OrganizationOut,
     InstanceCreate, InstanceUpdate, InstanceOut,
