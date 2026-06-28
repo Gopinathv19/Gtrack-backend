@@ -2,14 +2,16 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_roles
+from app.api.v1.endpoints.auth import _build_token_pair
 from app.core.config import settings
 from app.core.security import generate_invite_token, hash_password
 from app.models import Group, Instance, Invite, Role, User, UserRole
 from app.models.enums import InviteStatus, RoleName
+from app.schemas.auth import TokenPair
 from app.schemas.invite import (
     InviteAccept,
     InviteCreate,
@@ -61,8 +63,20 @@ def create_invite(
     )
 
 
-@router.post("/accept", response_model=UserOut, status_code=201)
-def accept_invite(token: str, payload: InviteAccept, db: Session = Depends(get_db)):
+@router.post("/accept", response_model=TokenPair, status_code=201)
+def accept_invite(
+    response: Response,
+    payload: InviteAccept,
+    token: str = Query(..., description="Invite token from the accept URL"),
+    db: Session = Depends(get_db),
+):
+    """Accept an invite and log the user in.
+
+    The ``token`` is read from the query string (matching the URL embedded in
+    the invite email), and credentials/name come from the JSON body. On
+    success we issue a fresh access + refresh token pair so the new member
+    lands in the app already authenticated.
+    """
     invite = db.query(Invite).filter(Invite.token == token).one_or_none()
     if not invite:
         raise HTTPException(404, "Invalid invite token")
@@ -86,6 +100,19 @@ def accept_invite(token: str, payload: InviteAccept, db: Session = Depends(get_d
         db.add(user)
         db.flush()
     else:
+        # Existing account (e.g. someone registered first, then opened the
+        # invite link). Attach them to the inviting org if they have none,
+        # otherwise reject cross-org conflicts instead of silently
+        # overwriting their tenant.
+        if user.organization_id is None:
+            user.organization_id = invite.organization_id
+        elif user.organization_id != invite.organization_id:
+            raise HTTPException(
+                400,
+                "This email already belongs to another organization.",
+            )
+        if payload.name:
+            user.name = payload.name
         user.hashed_password = hash_password(payload.password)
         user.is_active = True
 
@@ -106,7 +133,10 @@ def accept_invite(token: str, payload: InviteAccept, db: Session = Depends(get_d
     invite.accepted_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(user)
-    return user
+
+    # Auto-login: issue an access token + set refresh cookie so the client
+    # can drop straight into the dashboard.
+    return _build_token_pair(db, user, response)
 
 
 @router.post("/{invite_id}/resend", status_code=status.HTTP_204_NO_CONTENT)

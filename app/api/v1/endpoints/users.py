@@ -27,8 +27,19 @@ def list_users(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    me: User = Depends(require_roles(RoleName.ORG_ADMIN)),
+    me: User = Depends(get_current_user),
 ):
+    """List members of the caller's organization.
+
+    Any authenticated user that belongs to an organization can see who else
+    is in it. Mutating endpoints (create/delete/role assignment) remain
+    gated by ``ORG_ADMIN``.
+    """
+    if me.organization_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You must join an organization before listing its members.",
+        )
     q = db.query(User).filter(User.organization_id == me.organization_id)
     total = q.count()
     items = q.offset((page - 1) * per_page).limit(per_page).all()

@@ -266,7 +266,11 @@ class Asset(Base, TimestampMixin):
 # ---------- Sacks ----------
 class Sack(Base, TimestampMixin):
     __tablename__ = "sacks"
-    __table_args__ = (Index("ix_sack_status", "status"),)
+    __table_args__ = (
+        Index("ix_sack_status", "status"),
+        Index("ix_sack_origin_location", "origin_location_id"),
+        Index("ix_sack_destination_location", "destination_location_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     sack_code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
@@ -278,6 +282,19 @@ class Sack(Base, TimestampMixin):
     )
     status: Mapped[SackStatus] = mapped_column(
         SAEnum(SackStatus, name="sack_status"), nullable=False, default=SackStatus.CREATED
+    )
+    # Origin / source location — where the sack starts its journey.
+    # Assigned by the store at creation time and editable in-flight by
+    # ORG_ADMIN / STORE_MAINTAINER via ``/sacks/{id}/origin``.
+    origin_location_id: Mapped[UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("locations.id", ondelete="SET NULL"), nullable=True
+    )
+    # Intended drop-off location. Assigned by the store at creation time
+    # and editable in-flight by ORG_ADMIN / STORE_MAINTAINER (see
+    # ``/sacks/{id}/destination``). Nullable because legacy rows predate
+    # the field.
+    destination_location_id: Mapped[UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("locations.id", ondelete="SET NULL"), nullable=True
     )
     created_by: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False

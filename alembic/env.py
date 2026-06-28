@@ -2,7 +2,7 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 
 from app.core.config import settings
 from app.db.base_class import Base
@@ -10,8 +10,12 @@ import app.models  # noqa: F401  Import all models so metadata is populated
 
 config = context.config
 
-# Override sqlalchemy URL from environment
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# NOTE: we intentionally do NOT call ``config.set_main_option("sqlalchemy.url", ...)``
+# here. ConfigParser performs `%`-interpolation on values written to the ini
+# section, which breaks URL-encoded passwords (e.g. ``%40`` for ``@``) and
+# raises ``ValueError: invalid interpolation syntax``. Instead, we pull the
+# URL directly from settings at engine-creation time and bypass the ini.
+DATABASE_URL = settings.DATABASE_URL
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -20,9 +24,8 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -33,9 +36,10 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    # Build the engine directly from the live settings URL so URL-encoded
+    # characters (``%XX``) pass through untouched.
+    connectable = create_engine(
+        DATABASE_URL,
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:

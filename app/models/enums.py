@@ -13,11 +13,16 @@ class AssetStatus(str, enum.Enum):
 
 
 class SackStatus(str, enum.Enum):
+    """Sack lifecycle.
+
+    CREATED → IN_TRANSIT (picked up by shifting person)
+            → DELIVERED  (delivered by shifting person)
+            → RECEIVED   (received by sysadmin; terminal)
+    """
     CREATED = "CREATED"
-    PICKED_UP = "PICKED_UP"
     IN_TRANSIT = "IN_TRANSIT"
     DELIVERED = "DELIVERED"
-    CLOSED = "CLOSED"
+    RECEIVED = "RECEIVED"
 
 
 class AssetMovementAction(str, enum.Enum):
@@ -35,9 +40,8 @@ class AssetMovementAction(str, enum.Enum):
 class SackMovementAction(str, enum.Enum):
     CREATED = "CREATED"
     PICKED_UP = "PICKED_UP"
-    IN_TRANSIT = "IN_TRANSIT"
     DELIVERED = "DELIVERED"
-    CLOSED = "CLOSED"
+    RECEIVED = "RECEIVED"
 
 
 class InviteStatus(str, enum.Enum):
@@ -68,9 +72,8 @@ ASSET_TRANSITIONS: dict[AssetStatus, set[AssetStatus]] = {
 
 # Valid sack status transitions
 SACK_TRANSITIONS: dict[SackStatus, set[SackStatus]] = {
-    SackStatus.CREATED: {SackStatus.PICKED_UP},
-    SackStatus.PICKED_UP: {SackStatus.IN_TRANSIT, SackStatus.DELIVERED},
+    SackStatus.CREATED: {SackStatus.IN_TRANSIT},
     SackStatus.IN_TRANSIT: {SackStatus.DELIVERED},
-    SackStatus.DELIVERED: {SackStatus.CLOSED},
-    SackStatus.CLOSED: set(),
+    SackStatus.DELIVERED: {SackStatus.RECEIVED},
+    SackStatus.RECEIVED: set(),
 }
