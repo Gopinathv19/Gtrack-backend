@@ -49,7 +49,7 @@ def create_location(
     group_id: UUID,
     payload: LocationCreate,
     db: Session = Depends(get_db),
-    me: User = Depends(require_roles(RoleName.ORG_ADMIN)),
+    me: User = Depends(require_roles(RoleName.ORG_ADMIN, RoleName.STORE_MAINTAINER)),
 ):
     _ensure_group_in_tenant(db, group_id, me)
     loc = Location(group_id=group_id, **payload.model_dump())
@@ -77,7 +77,7 @@ def update_location(
     location_id: UUID,
     payload: LocationUpdate,
     db: Session = Depends(get_db),
-    me: User = Depends(require_roles(RoleName.ORG_ADMIN)),
+    me: User = Depends(require_roles(RoleName.ORG_ADMIN, RoleName.STORE_MAINTAINER)),
 ):
     loc = db.get(Location, location_id)
     if not loc:
@@ -94,7 +94,7 @@ def update_location(
 def delete_location(
     location_id: UUID,
     db: Session = Depends(get_db),
-    me: User = Depends(require_roles(RoleName.ORG_ADMIN)),
+    me: User = Depends(require_roles(RoleName.ORG_ADMIN, RoleName.STORE_MAINTAINER)),
 ):
     loc = db.get(Location, location_id)
     if not loc:

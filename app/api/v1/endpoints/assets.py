@@ -67,6 +67,7 @@ def create_asset(
         current_location_id=payload.current_location_id,
         created_by=me.id,
         status=AssetStatus.CREATED,
+        requires_return=payload.requires_return,
     )
     try:
         db.add(asset)
@@ -110,6 +111,7 @@ def bulk_create_assets(
                 group_id=payload.group_id,
                 created_by=me.id,
                 status=AssetStatus.CREATED,
+                requires_return=payload.requires_return,
             )
             db.add(asset)
             db.flush()

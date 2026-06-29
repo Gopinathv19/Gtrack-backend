@@ -18,6 +18,11 @@ class AssetCreate(AssetBase):
     instance_id: UUID
     group_id: UUID
     current_location_id: UUID | None = None
+    # Set by the store manager when creating the ticket. True means a
+    # return leg is expected (e.g. swap-out scenario where the old asset
+    # has to come back). The asset only "closes" once it reaches the
+    # RETURNED terminal state.
+    requires_return: bool = False
 
 
 class AssetBulkCreate(BaseModel):
@@ -25,6 +30,7 @@ class AssetBulkCreate(BaseModel):
     group_id: UUID
     tickets: list[str] = Field(..., min_length=1, max_length=500)
     asset_type: str = Field(..., min_length=1, max_length=100)
+    requires_return: bool = False
 
 
 class AssetBulkResult(BaseModel):
@@ -37,6 +43,11 @@ class AssetUpdate(BaseModel):
     serial_number: str | None = None
     description: str | None = None
     current_location_id: UUID | None = None
+    # Allow the store manager to toggle the return-required flag after
+    # the fact (e.g. they forgot to tick it at creation time). The asset
+    # must not have entered its return leg yet, but we leave that
+    # business rule to the endpoint.
+    requires_return: bool | None = None
     # if updated_at is provided, used for optimistic concurrency
     updated_at: datetime | None = None
 
@@ -48,6 +59,7 @@ class AssetOut(ORMBase, AssetBase):
     group_id: UUID
     current_location_id: UUID | None = None
     status: AssetStatus
+    requires_return: bool = False
     created_by: UUID
     created_at: datetime
     updated_at: datetime

@@ -247,6 +247,14 @@ class Asset(Base, TimestampMixin):
     status: Mapped[AssetStatus] = mapped_column(
         SAEnum(AssetStatus, name="asset_status"), nullable=False, default=AssetStatus.CREATED
     )
+    # Set by the store manager at creation time. When true, the asset's
+    # lifecycle is only complete once it has been RETURNED (i.e. shipped
+    # back to the store after the forward leg). The Sack lifecycle filter
+    # uses this flag to decide whether a sack is "pending return" vs
+    # fully "closed".
+    requires_return: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_by: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )

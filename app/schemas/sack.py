@@ -1,10 +1,31 @@
 """Sack schemas."""
 from datetime import datetime
+from enum import Enum
 from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.schemas.common import ORMBase
 from app.models.enums import SackStatus, SackMovementAction
+
+
+class SackLifecycle(str, Enum):
+    """Derived "ticket-level" lifecycle for a sack.
+
+    Distinct from ``SackStatus`` which only tracks the *current leg*
+    (CREATED/IN_TRANSIT/DELIVERED/RECEIVED). Lifecycle answers the wider
+    question "is the work for this sack actually done?" — which depends
+    on whether any of the assets in it still need to come back.
+
+    - ACTIVE          → forward leg is in progress (sack not yet RECEIVED).
+    - PENDING_RETURN  → forward leg done, but at least one asset is
+                        flagged ``requires_return = True`` and hasn't
+                        reached its RETURNED terminal yet.
+    - CLOSED          → every ticket has reached its terminal state.
+    """
+
+    ACTIVE = "ACTIVE"
+    PENDING_RETURN = "PENDING_RETURN"
+    CLOSED = "CLOSED"
 
 
 class SackBase(BaseModel):
@@ -54,6 +75,11 @@ class SackOut(ORMBase, SackBase):
     organization_id: UUID
     group_id: UUID
     status: SackStatus
+    # Derived lifecycle (ACTIVE / PENDING_RETURN / CLOSED). Computed
+    # server-side from the sack status + the ``requires_return`` /
+    # ``status`` of each contained asset, so the UI can filter without
+    # needing to fetch all assets.
+    lifecycle: SackLifecycle = SackLifecycle.ACTIVE
     created_by: UUID
     origin_location_id: UUID | None = None
     origin_location_name: str | None = None
@@ -63,8 +89,38 @@ class SackOut(ORMBase, SackBase):
     # need a second roundtrip just to render "Created by Jane".
     created_by_name: str | None = None
     created_by_email: str | None = None
+    # Counts used by the lifecycle UI to explain *why* a sack is
+    # PENDING_RETURN ("3 of 5 assets still to return") without an extra
+    # round-trip.
+    asset_count: int = 0
+    pending_return_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class ReturnAssetActionRequest(BaseModel):
+    """Body for one of the per-asset reverse-leg actions.
+
+    The reverse leg is modelled as three discrete steps on the *same*
+    sack the asset originally shipped on:
+
+      1. ``POST .../mark-return``   — sysadmin marks the asset
+         PACKED_FOR_RETURN once they've confirmed it's coming back.
+      2. ``POST .../pickup-return`` — shift person picks it up; the
+         asset moves to IN_TRANSIT and the asset's
+         ``current_location_id`` snaps to the sack origin (or the
+         override below).
+      3. ``POST .../receive-return`` — store manager confirms the
+         asset is back; the asset moves to its terminal RETURNED state.
+
+    ``location_id`` is optional. When omitted, each step falls back to
+    the sack's ``origin_location_id`` (i.e. "back to the store"), which
+    is what the timeline + asset.current_location_id should reflect for
+    the common case.
+    """
+
+    location_id: UUID | None = None
+    remarks: str | None = None
 
 
 class SackAssetsAdd(BaseModel):

@@ -28,11 +28,13 @@ from app.models.enums import (
 from app.schemas.asset import AssetOut
 from app.schemas.common import Page
 from app.schemas.sack import (
+    ReturnAssetActionRequest,
     SackActionRequest,
     SackAssetsAdd,
     SackAssetsAddResult,
     SackCreate,
     SackDestinationUpdate,
+    SackLifecycle,
     SackMovementOut,
     SackOriginUpdate,
     SackOut,
@@ -53,6 +55,103 @@ def _get_sack(db: Session, sack_id: UUID, me: User) -> Sack:
     return s
 
 
+# Asset terminal / "still in flight" helpers used by the lifecycle
+# computation below.
+_RETURN_LEG_OPEN_STATES = {
+    AssetStatus.PACKED_FOR_RETURN,
+    AssetStatus.IN_TRANSIT,  # for return-required assets, this is the reverse leg
+}
+
+_TERMINAL_STATES = {
+    AssetStatus.RETURNED,
+    AssetStatus.DAMAGED,
+    AssetStatus.LOST,
+}
+
+
+def _asset_is_done(a: Asset) -> bool:
+    """True when the asset's lifecycle is complete from the sack's pov.
+
+    - "no return needed" assets are done at RECEIVED.
+    - "return required" assets are done at RETURNED.
+    - DAMAGED / LOST always count as done.
+    """
+    if a.status in (AssetStatus.DAMAGED, AssetStatus.LOST):
+        return True
+    if a.requires_return:
+        return a.status == AssetStatus.RETURNED
+    return a.status == AssetStatus.RECEIVED
+
+
+def _compute_lifecycle(
+    sack: Sack, assets: list[Asset]
+) -> tuple[SackLifecycle, int, int]:
+    """Derive the lifecycle of a sack from its contents.
+
+    Returns ``(lifecycle, asset_count, pending_return_count)``.
+
+    Rules:
+    - CLOSED  ⇔ every asset in the sack has reached its terminal —
+                RECEIVED for "no return needed" assets and RETURNED for
+                "return required" assets (DAMAGED / LOST also terminal).
+    - PENDING_RETURN ⇔ the forward leg of the sack is RECEIVED and at
+                least one return-required asset still hasn't been
+                RETURNED. This is the state where the 3-step reverse
+                flow (sysadmin → shift person → store manager) runs in
+                place on the same sack.
+    - ACTIVE  ⇔ everything else (forward leg still in flight, etc).
+    """
+    asset_count = len(assets)
+    if asset_count == 0:
+        # Empty sack — only "closed" if the sack itself was RECEIVED;
+        # otherwise it's just sitting there, ACTIVE.
+        if sack.status == SackStatus.RECEIVED:
+            return SackLifecycle.CLOSED, 0, 0
+        return SackLifecycle.ACTIVE, 0, 0
+
+    pending_return_count = sum(
+        1
+        for a in assets
+        if a.requires_return and a.status not in _TERMINAL_STATES
+    )
+
+    if all(_asset_is_done(a) for a in assets):
+        return SackLifecycle.CLOSED, asset_count, pending_return_count
+
+    # PENDING_RETURN once the forward leg is done and the only open work
+    # is the reverse leg for one or more return-required assets.
+    if (
+        sack.status == SackStatus.RECEIVED
+        and pending_return_count > 0
+        and all(
+            _asset_is_done(a)
+            or (
+                a.requires_return
+                and a.status
+                in (
+                    AssetStatus.RECEIVED,
+                    AssetStatus.PACKED_FOR_RETURN,
+                    AssetStatus.IN_TRANSIT,
+                )
+            )
+            for a in assets
+        )
+    ):
+        return SackLifecycle.PENDING_RETURN, asset_count, pending_return_count
+
+    return SackLifecycle.ACTIVE, asset_count, pending_return_count
+
+
+def _sack_assets(db: Session, sack_id: UUID) -> list[Asset]:
+    """Return the assets currently packed into ``sack_id``."""
+    return (
+        db.query(Asset)
+        .join(SackAsset, SackAsset.asset_id == Asset.id)
+        .filter(SackAsset.sack_id == sack_id)
+        .all()
+    )
+
+
 def _sack_to_out(db: Session, sack: Sack) -> dict:
     """Serialize a sack with denormalised "created by" + destination data.
 
@@ -71,12 +170,15 @@ def _sack_to_out(db: Session, sack: Sack) -> dict:
         if sack.destination_location_id
         else None
     )
+    assets = _sack_assets(db, sack.id)
+    lifecycle, asset_count, pending_return_count = _compute_lifecycle(sack, assets)
     return {
         "id": sack.id,
         "sack_code": sack.sack_code,
         "organization_id": sack.organization_id,
         "group_id": sack.group_id,
         "status": sack.status,
+        "lifecycle": lifecycle,
         "created_by": sack.created_by,
         "origin_location_id": sack.origin_location_id,
         "origin_location_name": origin.name if origin else None,
@@ -84,6 +186,8 @@ def _sack_to_out(db: Session, sack: Sack) -> dict:
         "destination_location_name": dest.name if dest else None,
         "created_by_name": creator.name if creator else None,
         "created_by_email": creator.email if creator else None,
+        "asset_count": asset_count,
+        "pending_return_count": pending_return_count,
         "created_at": sack.created_at,
         "updated_at": sack.updated_at,
     }
@@ -223,6 +327,14 @@ def create_sack(
 @router.get("", response_model=Page[SackOut])
 def list_sacks(
     status_filter: SackStatus | None = Query(None, alias="status"),
+    lifecycle: SackLifecycle | None = Query(
+        None,
+        description=(
+            "Filter by derived lifecycle: ACTIVE (forward leg in progress),"
+            " PENDING_RETURN (forward done, returns outstanding),"
+            " or CLOSED (every ticket terminal)."
+        ),
+    ),
     group_id: UUID | None = Query(None),
     ticket_id: str | None = Query(
         None,
@@ -248,11 +360,28 @@ def list_sacks(
                 .filter(Asset.ticket_id.ilike(f"%{ticket_q}%"))
                 .distinct()
             )
+
+    # Lifecycle is derived (not a column), so we can't push it down into
+    # the SQL filter. The trade-off is acceptable: we always pre-filter
+    # by ``status`` so the candidate set is small enough to materialise
+    # and classify in Python. When lifecycle == ACTIVE we even short-
+    # circuit at the SQL layer (Sack.status != RECEIVED).
+    if lifecycle == SackLifecycle.ACTIVE:
+        q = q.filter(Sack.status != SackStatus.RECEIVED)
+    elif lifecycle in (SackLifecycle.PENDING_RETURN, SackLifecycle.CLOSED):
+        q = q.filter(Sack.status == SackStatus.RECEIVED)
+
     q = q.order_by(Sack.created_at.desc())
-    total = q.count()
-    items = q.offset((page - 1) * per_page).limit(per_page).all()
+    candidates = q.all()
+
+    serialized = [_sack_to_out(db, s) for s in candidates]
+    if lifecycle is not None:
+        serialized = [s for s in serialized if s["lifecycle"] == lifecycle]
+
+    total = len(serialized)
+    start = (page - 1) * per_page
     return Page(
-        items=[_sack_to_out(db, s) for s in items],
+        items=serialized[start : start + per_page],
         total=total,
         page=page,
         per_page=per_page,
@@ -409,13 +538,42 @@ def _transition_sack(
 ) -> Sack:
     validate_sack_transition(sack.status, new_status)
     sack.status = new_status
+
+    # Fall back to the sack's known origin / destination when the caller
+    # doesn't pass explicit locations. The pickup / deliver / receive
+    # actions are normally invoked from the UI without a location payload,
+    # but the sack itself already knows where it's coming from and where
+    # it's headed — so the timeline (and downstream asset rows) should
+    # reflect that instead of showing blank "From — / To —" entries.
+    from_loc_id = payload.from_location_id
+    to_loc_id = payload.to_location_id
+    if from_loc_id is None:
+        if action == SackMovementAction.PICKED_UP:
+            from_loc_id = sack.origin_location_id
+        elif action in (
+            SackMovementAction.DELIVERED,
+            SackMovementAction.RECEIVED,
+        ):
+            # Deliver/receive: we've left the origin and arrived at the
+            # destination, so the movement row goes origin → destination.
+            from_loc_id = sack.origin_location_id
+    if to_loc_id is None:
+        if action == SackMovementAction.PICKED_UP:
+            # Picked up from origin, heading toward the destination.
+            to_loc_id = sack.destination_location_id
+        elif action in (
+            SackMovementAction.DELIVERED,
+            SackMovementAction.RECEIVED,
+        ):
+            to_loc_id = sack.destination_location_id
+
     db.add(
         SackMovement(
             sack_id=sack.id,
             action=action,
             performed_by=me.id,
-            from_location_id=payload.from_location_id,
-            to_location_id=payload.to_location_id,
+            from_location_id=from_loc_id,
+            to_location_id=to_loc_id,
             remarks=payload.remarks,
         )
     )
@@ -432,19 +590,19 @@ def _transition_sack(
                 # skip already-DELIVERED etc.
                 continue
             asset.status = asset_status
-            if payload.to_location_id and asset_status in (
+            if to_loc_id and asset_status in (
                 AssetStatus.DELIVERED,
                 AssetStatus.RECEIVED,
             ):
-                asset.current_location_id = payload.to_location_id
+                asset.current_location_id = to_loc_id
             db.add(
                 AssetMovement(
                     asset_id=asset.id,
                     sack_id=sack.id,
                     action=asset_action,
                     performed_by=me.id,
-                    from_location_id=payload.from_location_id,
-                    to_location_id=payload.to_location_id,
+                    from_location_id=from_loc_id,
+                    to_location_id=to_loc_id,
                     remarks=payload.remarks,
                 )
             )
@@ -633,6 +791,239 @@ def update_sack_destination(
             remarks=note,
         )
     )
+    db.commit()
+    db.refresh(sack)
+    return _sack_to_out(db, sack)
+
+
+# ---------- Reverse-leg actions (per asset, in place) ----------
+#
+# The reverse leg is broken into three distinct, role-gated steps so
+# the audit trail captures who did what:
+#
+#   1. mark-return     — SYSADMIN / ORG_ADMIN.   RECEIVED → PACKED_FOR_RETURN
+#   2. pickup-return   — SHIFT_PERSON / ORG_ADMIN. PACKED_FOR_RETURN → IN_TRANSIT
+#   3. receive-return  — STORE_MAINTAINER / ORG_ADMIN. IN_TRANSIT → RETURNED
+#
+# All three live on the same sack the asset was originally shipped on
+# — no new "return sack" is created. The sack-level audit timeline uses
+# the existing SackMovementAction enum (PICKED_UP / DELIVERED /
+# RECEIVED) with descriptive remarks so we don't need an enum
+# migration just to add return-specific actions.
+
+
+def _resolve_sack_and_asset(
+    db: Session, sack_id: UUID, asset_id: UUID, me: User
+) -> tuple[Sack, Asset]:
+    """Shared precondition for the reverse-leg endpoints.
+
+    Validates the sack exists in the caller's tenant, the asset is
+    actually packed in it, and that the sack's forward leg is RECEIVED
+    (so the reverse leg can legally begin / continue).
+    """
+    sack = _get_sack(db, sack_id, me)
+    if sack.status != SackStatus.RECEIVED:
+        raise HTTPException(
+            400,
+            "Reverse-leg actions are only allowed once the sack has been RECEIVED",
+        )
+    sa = (
+        db.query(SackAsset)
+        .filter(SackAsset.sack_id == sack.id, SackAsset.asset_id == asset_id)
+        .one_or_none()
+    )
+    if not sa:
+        raise HTTPException(404, "Asset is not in this sack")
+    asset = db.get(Asset, asset_id)
+    if not asset or asset.organization_id != me.organization_id:
+        raise HTTPException(404, "Asset not found")
+    if not asset.requires_return:
+        raise HTTPException(
+            400, "This asset was not flagged as needing a return"
+        )
+    return sack, asset
+
+
+@router.post("/{sack_id}/assets/{asset_id}/mark-return", response_model=SackOut)
+def mark_asset_for_return(
+    sack_id: UUID,
+    asset_id: UUID,
+    payload: ReturnAssetActionRequest,
+    db: Session = Depends(get_db),
+    me: User = Depends(require_roles(RoleName.SYSADMIN, RoleName.ORG_ADMIN)),
+):
+    """Step 1 — sysadmin flags a RECEIVED asset for return.
+
+    Transitions ``asset.status`` from RECEIVED → PACKED_FOR_RETURN and
+    leaves it physically at the sack's destination (the asset still
+    hasn't moved). The shift person picks it up in step 2.
+    """
+    sack, asset = _resolve_sack_and_asset(db, sack_id, asset_id, me)
+    if asset.status != AssetStatus.RECEIVED:
+        raise HTTPException(
+            409,
+            f"Asset must be RECEIVED to be marked for return; current status is {asset.status.value}",
+        )
+
+    validate_asset_transition(asset.status, AssetStatus.PACKED_FOR_RETURN)
+    asset.status = AssetStatus.PACKED_FOR_RETURN
+
+    # `location_id` here means "where the asset currently sits while
+    # waiting for pickup" — defaults to the sack destination (where the
+    # forward leg dropped it). We don't change current_location_id.
+    note_location_id = payload.location_id or sack.destination_location_id
+
+    db.add(
+        AssetMovement(
+            asset_id=asset.id,
+            sack_id=sack.id,
+            action=AssetMovementAction.PACKED,
+            performed_by=me.id,
+            from_location_id=asset.current_location_id,
+            to_location_id=note_location_id,
+            remarks=payload.remarks or "Marked for return",
+        )
+    )
+    note = f"Asset {asset.ticket_id} marked for return"
+    if payload.remarks:
+        note = f"{note} ({payload.remarks})"
+    db.add(
+        SackMovement(
+            sack_id=sack.id,
+            action=SackMovementAction.CREATED,  # reused as "metadata change"
+            performed_by=me.id,
+            from_location_id=asset.current_location_id,
+            to_location_id=note_location_id,
+            remarks=note,
+        )
+    )
+
+    db.commit()
+    db.refresh(sack)
+    return _sack_to_out(db, sack)
+
+
+@router.post(
+    "/{sack_id}/assets/{asset_id}/pickup-return", response_model=SackOut
+)
+def pickup_returned_asset(
+    sack_id: UUID,
+    asset_id: UUID,
+    payload: ReturnAssetActionRequest,
+    db: Session = Depends(get_db),
+    me: User = Depends(require_roles(RoleName.SHIFT_PERSON, RoleName.ORG_ADMIN)),
+):
+    """Step 2 — shift person picks the marked asset up for return.
+
+    Transitions ``asset.status`` from PACKED_FOR_RETURN → IN_TRANSIT
+    (now travelling back to the store). The asset's
+    ``current_location_id`` is left untouched until the store manager
+    confirms receipt in step 3 — at that point the asset's location
+    snaps to the sack origin (or the override).
+    """
+    sack, asset = _resolve_sack_and_asset(db, sack_id, asset_id, me)
+    if asset.status != AssetStatus.PACKED_FOR_RETURN:
+        raise HTTPException(
+            409,
+            f"Asset must be PACKED_FOR_RETURN before pickup; current status is {asset.status.value}",
+        )
+
+    validate_asset_transition(asset.status, AssetStatus.IN_TRANSIT)
+    asset.status = AssetStatus.IN_TRANSIT
+
+    from_loc = asset.current_location_id or sack.destination_location_id
+    to_loc = payload.location_id or sack.origin_location_id
+
+    db.add(
+        AssetMovement(
+            asset_id=asset.id,
+            sack_id=sack.id,
+            action=AssetMovementAction.PICKED_UP,
+            performed_by=me.id,
+            from_location_id=from_loc,
+            to_location_id=to_loc,
+            remarks=payload.remarks or "Picked up for return",
+        )
+    )
+    note = f"Asset {asset.ticket_id} picked up for return"
+    if payload.remarks:
+        note = f"{note} ({payload.remarks})"
+    db.add(
+        SackMovement(
+            sack_id=sack.id,
+            action=SackMovementAction.PICKED_UP,
+            performed_by=me.id,
+            from_location_id=from_loc,
+            to_location_id=to_loc,
+            remarks=note,
+        )
+    )
+
+    db.commit()
+    db.refresh(sack)
+    return _sack_to_out(db, sack)
+
+
+@router.post(
+    "/{sack_id}/assets/{asset_id}/receive-return", response_model=SackOut
+)
+def receive_returned_asset(
+    sack_id: UUID,
+    asset_id: UUID,
+    payload: ReturnAssetActionRequest,
+    db: Session = Depends(get_db),
+    me: User = Depends(
+        require_roles(RoleName.STORE_MAINTAINER, RoleName.ORG_ADMIN)
+    ),
+):
+    """Step 3 — store manager confirms the asset is back at the store.
+
+    Transitions ``asset.status`` from IN_TRANSIT → RETURNED (terminal)
+    and updates ``asset.current_location_id`` to the chosen return
+    location (defaults to the sack's origin — i.e. the store).
+    """
+    sack, asset = _resolve_sack_and_asset(db, sack_id, asset_id, me)
+    if asset.status != AssetStatus.IN_TRANSIT:
+        raise HTTPException(
+            409,
+            f"Asset must be IN_TRANSIT to be received as returned; current status is {asset.status.value}",
+        )
+
+    return_location_id = payload.location_id or sack.origin_location_id
+    if return_location_id:
+        _ensure_location_in_tenant(db, return_location_id, me)
+
+    validate_asset_transition(asset.status, AssetStatus.RETURNED)
+    prev_location = asset.current_location_id
+    asset.status = AssetStatus.RETURNED
+    if return_location_id:
+        asset.current_location_id = return_location_id
+
+    db.add(
+        AssetMovement(
+            asset_id=asset.id,
+            sack_id=sack.id,
+            action=AssetMovementAction.RECEIVED,
+            performed_by=me.id,
+            from_location_id=prev_location,
+            to_location_id=return_location_id,
+            remarks=payload.remarks or "Returned to store",
+        )
+    )
+    note = f"Asset {asset.ticket_id} returned to store"
+    if payload.remarks:
+        note = f"{note} ({payload.remarks})"
+    db.add(
+        SackMovement(
+            sack_id=sack.id,
+            action=SackMovementAction.RECEIVED,
+            performed_by=me.id,
+            from_location_id=prev_location,
+            to_location_id=return_location_id,
+            remarks=note,
+        )
+    )
+
     db.commit()
     db.refresh(sack)
     return _sack_to_out(db, sack)
