@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
+import json
 from functools import lru_cache
-from typing import List
+from typing import List, Union
 
 from pydantic import Field, AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,7 +49,11 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 100
 
     # CORS
-    BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000"]
+    # NOTE: typed as Union[str, List[str]] so pydantic-settings does NOT try to
+    # JSON-decode the raw env value before our validator runs. This lets users
+    # provide either a JSON array (`["https://a.com","https://b.com"]`) OR a
+    # simple comma-separated string (`https://a.com,https://b.com`) OR `*`.
+    BACKEND_CORS_ORIGINS: Union[str, List[str]] = ["http://localhost:3000"]
 
     # Refresh token cookie
     REFRESH_COOKIE_NAME: str = "refresh_token"
@@ -60,7 +65,22 @@ class Settings(BaseSettings):
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v):
-        if isinstance(v, str) and not v.startswith("["):
+        # Already a list -> keep as is
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            # JSON array form: ["https://a.com","https://b.com"]
+            if v.startswith("["):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(i).strip() for i in parsed if str(i).strip()]
+                except json.JSONDecodeError:
+                    pass
+            # Comma-separated form or single origin (e.g. "*", "https://a.com,https://b.com")
             return [i.strip() for i in v.split(",") if i.strip()]
         return v
 
