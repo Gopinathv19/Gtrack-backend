@@ -65,7 +65,11 @@ def _build_token_pair(db: Session, user: User, response: Response) -> TokenPair:
 
     roles = get_user_roles(db, user.id)
     access = create_access_token(
-        user_id=user.id, org_id=user.organization_id, email=user.email, roles=roles
+        user_id=user.id,
+        org_id=user.organization_id,
+        email=user.email,
+        name=user.name,
+        roles=roles,
     )
     raw_refresh, refresh_hash = generate_refresh_token()
     rt = RefreshToken(

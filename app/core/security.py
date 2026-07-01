@@ -46,6 +46,7 @@ def create_access_token(
     user_id: UUID | str,
     org_id: UUID | str | None = None,
     email: str | None = None,
+    name: str | None = None,
     roles: list[str] | None = None,
     expires_minutes: int | None = None,
 ) -> str:
@@ -58,6 +59,7 @@ def create_access_token(
         # created or joined an organization yet.
         "org_id": str(org_id) if org_id is not None else None,
         "email": email,
+        "name": name,
         "roles": roles or [],
         "iss": settings.JWT_ISSUER,
         "aud": settings.JWT_AUDIENCE,
